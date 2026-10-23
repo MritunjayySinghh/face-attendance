@@ -1,4 +1,3 @@
-import csv
 import glob
 import os
 import time
@@ -6,6 +5,9 @@ from datetime import datetime
 
 import cv2
 import numpy as np
+
+import database
+import voice
 
 # ---------- Settings ----------
 # Small numbers so you can test at your desk. Real lecture values are in the comments.
@@ -16,6 +18,7 @@ LEFT_AFTER_SECONDS = 20    # real: 420 (7 minutes) -> not seen for this long = "
 PRESENT_PERCENT = 80       # seen in at least 80% of checks = Present
 THRESHOLD = 0.5            # stricter than recognize.py (0.363), so fewer wrong matches
 CONFIRM_FRAMES = 5         # must be recognised in 5 frames in a row before we count them
+EARLIEST_END_MINUTES = 1   # real: 30 -> ignore "see you next week" before this (no early false alarms)
 
 # ---------- Face recognition (same idea as recognize.py) ----------
 detector = cv2.FaceDetectorYN.create("models/face_detection_yunet_2026may.onnx", "", (320, 320))
@@ -26,6 +29,17 @@ for path in glob.glob("data/*.npy"):
     name = os.path.splitext(os.path.basename(path))[0]
     people[name] = np.load(path)
 print("Known people:", list(people))
+
+# ---------- Which lecture is this, and who is supposed to be here? ----------
+module = input("Module code (e.g. COMP1312): ").strip().upper()
+expected = database.class_list(module)
+if not expected:
+    print(f"No class list for {module} in data/class_lists.csv, so everyone enrolled is expected")
+    expected = list(people)
+for name in expected:
+    if name not in people:
+        print(f"Warning: {name} is on the class list but hasn't enrolled their face yet")
+print("Supposed to be here:", expected)
 
 
 def recognise(frame):
@@ -81,6 +95,7 @@ total_checks = 0
 seen_since_last_check = set()
 next_check = start + CHECK_EVERY_SECONDS
 
+voice.start()                                 # start listening to the microphone
 cap = cv2.VideoCapture(0)
 
 while True:
@@ -130,13 +145,23 @@ while True:
             status = "in the room"
         percent = round(100 * seen_checks[name] / total_checks) if total_checks else 0
         write(frame, f"{name}: {status} ({percent}%)", row)
+    write(frame, "Mic: " + " ".join(voice.last_heard.split()[-6:]), len(people) + 2)
 
     cv2.imshow("Attendance", frame)
 
-    # 4. Keys: E = lecturer says it's over, Q = stop now
+    # 4. Did the lecturer say "see you next week"? (Pressing E does the same)
     key = cv2.waitKey(1)
+    if voice.lecture_over.is_set():
+        voice.lecture_over.clear()
+        if now - start >= EARLIEST_END_MINUTES * 60:
+            free_to_go = min(free_to_go, now)
+            print(f'Heard "{voice.last_heard}" -> FREE TO GO')
+        else:
+            print(f'Heard "{voice.last_heard}" but it is too early, ignoring it')
     if key in (ord('e'), ord('E')):
         free_to_go = min(free_to_go, now)
+
+    # 5. Q = stop now
     if key in (ord('q'), ord('Q')) or now >= end:
         break
 
@@ -145,9 +170,10 @@ cv2.destroyAllWindows()
 
 # ---------- Final attendance ----------
 free_to_go = min(free_to_go, time.time())   # if we stopped early, the lecture ended now
+everyone = expected + [name for name in first_seen if name not in expected]
 rows = []
-for name in people:
-    percent = round(100 * seen_checks[name] / total_checks) if total_checks else 0
+for name in everyone:
+    percent = round(100 * seen_checks.get(name, 0) / total_checks) if total_checks else 0
     if name not in first_seen or percent == 0:
         status = "Absent"
     elif percent >= PRESENT_PERCENT:
@@ -156,15 +182,14 @@ for name in people:
         status = "Left early"
     else:
         status = "Partial"
-    arrived = clock(first_seen[name]) if name in first_seen else "-"
-    left = clock(last_seen[name]) if name in last_seen else "-"
-    rows.append([name, status, percent, arrived, left])
-    print(f"{name}: {status} ({percent}%), arrived {arrived}, last seen {left}")
+    on_list = 1 if name in expected else 0
+    arrived = clock(first_seen[name]) if name in first_seen else None
+    left = clock(last_seen[name]) if name in last_seen else None
+    rows.append((name, on_list, status, percent, arrived, left))
+    print(f"{name}: {status} ({percent}%), arrived {arrived or '-'}, last seen {left or '-'}"
+          + ("" if on_list else "  <- not on the class list"))
 
-os.makedirs("data/attendance", exist_ok=True)
-filename = "data/attendance/" + datetime.fromtimestamp(start).strftime("%Y-%m-%d_%H-%M") + ".csv"
-with open(filename, "w", newline="") as file:
-    writer = csv.writer(file)
-    writer.writerow(["name", "status", "percent", "arrived", "last_seen"])
-    writer.writerows(rows)
-print("Saved to", filename)
+started = datetime.fromtimestamp(start).strftime("%Y-%m-%d %H:%M")
+ended = datetime.now().strftime("%Y-%m-%d %H:%M")
+lecture_id = database.save_lecture(module, started, ended, rows)
+print(f"Saved lecture #{lecture_id} ({module}) to {database.DB_PATH}")
