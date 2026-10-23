@@ -10,11 +10,12 @@ import numpy as np
 # ---------- Settings ----------
 # Small numbers so you can test at your desk. Real lecture values are in the comments.
 LECTURE_MINUTES = 3        # real: 60
-FREE_TO_GO_MINUTES = 2.5    # real: 20 -> in the last 20 minutes, leaving is fine
-CHECK_EVERY_SECONDS = 5   # real: 30 -> how often we note who is in the room
-LEFT_AFTER_SECONDS = 20    # real: 120 -> not seen for this long = "left"
+FREE_TO_GO_MINUTES = 1     # real: 20 -> in the last 20 minutes, leaving is fine
+CHECK_EVERY_SECONDS = 5    # real: 30 -> how often we note who is in the room
+LEFT_AFTER_SECONDS = 20    # real: 420 (7 minutes) -> not seen for this long = "left"
 PRESENT_PERCENT = 80       # seen in at least 80% of checks = Present
-THRESHOLD = 0.363          # same face-match threshold as recognize.py
+THRESHOLD = 0.5            # stricter than recognize.py (0.363), so fewer wrong matches
+CONFIRM_FRAMES = 5         # must be recognised in 5 frames in a row before we count them
 
 # ---------- Face recognition (same idea as recognize.py) ----------
 detector = cv2.FaceDetectorYN.create("models/face_detection_yunet_2026may.onnx", "", (320, 320))
@@ -75,6 +76,7 @@ free_to_go = end - FREE_TO_GO_MINUTES * 60    # after this, leaving doesn't coun
 first_seen = {}                               # name -> when they arrived
 last_seen = {}                                # name -> when we last saw them
 seen_checks = {name: 0 for name in people}    # name -> how many checks they were seen in
+streak = {name: 0 for name in people}         # name -> frames in a row they've been recognised
 total_checks = 0
 seen_since_last_check = set()
 next_check = start + CHECK_EVERY_SECONDS
@@ -88,11 +90,18 @@ while True:
     now = time.time()
 
     # 1. Who is in the room right now?
+    seen_now = set()
     for name, (x, y, w, h) in recognise(frame):
         colour = (0, 0, 255) if name == "Unknown" else (0, 255, 0)
         cv2.rectangle(frame, (x, y), (x + w, y + h), colour, 2)
         cv2.putText(frame, name, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
         if name != "Unknown":
+            seen_now.add(name)
+
+    # Only trust a name after several frames in a row (ignores one-frame mistakes)
+    for name in people:
+        streak[name] = streak[name] + 1 if name in seen_now else 0
+        if streak[name] >= CONFIRM_FRAMES:
             first_seen.setdefault(name, now)
             last_seen[name] = now
             seen_since_last_check.add(name)
@@ -113,7 +122,7 @@ while True:
     else:
         write(frame, "FREE TO GO", 1)
     for row, name in enumerate(people, start=2):
-        if name not in first_seen or percent == 0:
+        if name not in first_seen:
             status = "not arrived"
         elif now - last_seen[name] > LEFT_AFTER_SECONDS:
             status = f"left at {clock(last_seen[name])}"
@@ -139,7 +148,7 @@ free_to_go = min(free_to_go, time.time())   # if we stopped early, the lecture e
 rows = []
 for name in people:
     percent = round(100 * seen_checks[name] / total_checks) if total_checks else 0
-    if name not in first_seen:
+    if name not in first_seen or percent == 0:
         status = "Absent"
     elif percent >= PRESENT_PERCENT:
         status = "Present"
